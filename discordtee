@@ -1,0 +1,170 @@
+#!/bin/bash
+
+# discordtee - Send stdin to Discord via webhook
+# Similar to slacktee but for Discord
+
+VERSION="1.0"
+CONFIG_FILE="/etc/discordtee.conf"
+
+# Default values
+WEBHOOK_URL=""
+USERNAME="discordtee"
+TITLE=""
+QUIET=true
+
+# Function to show usage
+usage() {
+    cat << EOF
+Usage: discordtee [OPTIONS]
+
+Send stdin to Discord via webhook.
+
+OPTIONS:
+    -t, --title TEXT     Set message title
+    -u, --username TEXT  Set username (default: discordtee)
+    -c, --config FILE    Use alternative config file (default: /etc/discordtee.conf)
+    -v, --verbose        Show success messages (default is quiet)
+    -h, --help          Show this help
+    --version           Show version
+
+CONFIGURATION FILE:
+The config file should contain:
+webhook_url="https://discord.com/api/webhooks/YOUR_WEBHOOK_URL"
+username="your-bot-name"
+
+EXAMPLE:
+echo "Hello World" | discordtee -t "Test Message"
+grep "error" /var/log/messages | discordtee -t "System Errors"
+
+EOF
+}
+
+# Function to load configuration
+load_config() {
+    if [[ -f "$CONFIG_FILE" ]]; then
+        source "$CONFIG_FILE"
+        WEBHOOK_URL="${webhook_url:-$WEBHOOK_URL}"
+        USERNAME="${username:-$USERNAME}"
+    else
+        echo "Error: Configuration file $CONFIG_FILE not found" >&2
+        echo "Create the config file with your Discord webhook URL:" >&2
+        echo 'webhook_url="https://discord.com/api/webhooks/YOUR_WEBHOOK_URL"' >&2
+        echo 'username="discordtee"' >&2
+        exit 1
+    fi
+}
+
+# Function to send message to Discord
+send_to_discord() {
+    local content="$1"
+    local title="$2"
+    
+    # Check if jq is available
+    if ! command -v jq >/dev/null 2>&1; then
+        echo "Error: jq is required but not installed. Please run: sudo dnf install jq" >&2
+        return 1
+    fi
+    
+    # Prepare the message
+    local message=""
+    if [[ -n "$title" ]]; then
+        message="**$title**"
+        message="$message"$'\n'
+    fi
+    
+    # Add content in code block to preserve formatting
+    if [[ -n "$content" ]]; then
+        message="$message\`\`\`"
+        message="$message"$'\n'"$content"$'\n'
+        message="$message\`\`\`"
+    fi
+    
+    # Create JSON using jq
+    local json_payload
+    json_payload=$(jq -n --arg username "$USERNAME" --arg content "$message" '{username: $username, content: $content}')
+    
+    if [[ $? -ne 0 ]]; then
+        echo "Error: Failed to create JSON payload" >&2
+        return 1
+    fi
+    
+    # Send to Discord
+    local response
+    response=$(curl -s -H "Content-Type: application/json" -X POST -d "$json_payload" "$WEBHOOK_URL")
+    
+    if [[ $? -ne 0 ]]; then
+        echo "Error: Failed to send message to Discord" >&2
+        return 1
+    fi
+    
+    # Check Discord API response for errors
+    if echo "$response" | grep -q '"message"'; then
+        echo "Error: Discord API error: $response" >&2
+        return 1
+    fi
+    
+    if [[ "$QUIET" != true ]]; then
+        echo "Message sent to Discord successfully"
+    fi
+    
+    return 0
+}
+
+# Parse command line arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -t|--title)
+            TITLE="$2"
+            shift 2
+            ;;
+        -u|--username)
+            USERNAME="$2"
+            shift 2
+            ;;
+        -c|--config)
+            CONFIG_FILE="$2"
+            shift 2
+            ;;
+        -v|--verbose)
+            QUIET=false
+            shift
+            ;;
+        -q|--quiet)
+            QUIET=true
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        --version)
+            echo "discordtee version $VERSION"
+            exit 0
+            ;;
+        *)
+            echo "Unknown option: $1" >&2
+            usage >&2
+            exit 1
+            ;;
+    esac
+done
+
+# Load configuration
+load_config
+
+# Check if webhook URL is set
+if [[ -z "$WEBHOOK_URL" ]]; then
+    echo "Error: webhook_url not configured in $CONFIG_FILE" >&2
+    exit 1
+fi
+
+# Read from stdin
+input=$(cat)
+
+# Send to Discord if there's content
+if [[ -n "$input" ]]; then
+    send_to_discord "$input" "$TITLE"
+else
+    echo "Warning: No input received from stdin" >&2
+    exit 1
+fi
